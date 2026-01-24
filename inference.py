@@ -76,7 +76,7 @@ def _load_images_from_paths(image_paths: Sequence[str], device: str, dtype: torc
             print(f"Warning: Image path does not exist: {p}")
             continue
         try:
-            img = Image.open(p).convert("RGB").resize((224, 224))
+            img = Image.open(p).convert("RGB").resize((1024, 1024))
             arr = np.asarray(img, dtype=np.float32) / 255.0
             arr = (arr - mean) / std
             t = torch.from_numpy(arr).permute(2, 0, 1).contiguous()
@@ -248,6 +248,8 @@ def inference(
                 images = _load_images_from_paths(image_paths, device=device, dtype=model_dtype)
                 if images is not None:
                     image_tokens = model.encode_images(images)
+                    if isinstance(image_tokens, tuple):
+                        image_tokens, _ = image_tokens
                 else:
                     image_tokens = torch.zeros((0, 0, 0), device=device, dtype=model_dtype)
                 text_embeds = model.model.embed_tokens(input_ids)
