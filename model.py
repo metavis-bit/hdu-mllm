@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from flash_attention import flash_attention_fn
 import math
 from typing import Optional, Tuple
+from FastVitHD_standalone import fastvithd
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -29,91 +30,53 @@ class Qwen3MLP(nn.Module):
     def forward(self, x):
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
-class ConvResidualBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int):
+
+class FastViTHDVisionEncoder(nn.Module):
+    def __init__(self):
         super().__init__()
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.backbone = fastvithd(
+            use_feature_fusion=True,
+            use_stage5_1d=True,
+            inference_mode=False,
+        )
+        self.out_dim = int(getattr(self.backbone.conv_exp, "out_channels"))
+
+    def forward(self, images: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        res = self.backbone(images, return_attn=True)
+        x = res
+        cls_attn = None
+        if isinstance(res, tuple):
+            if len(res) == 3:
+                _, x, cls_attn = res
+            elif len(res) == 2:
+                _, x = res
+            else:
+                x = res[-1]
+
+        if x.dim() == 4:
+            x = x.flatten(2).transpose(1, 2).contiguous()
+        elif x.dim() != 3:
+            raise ValueError(f"Unexpected FastViTHD output shape: {tuple(x.shape)}")
+
+        return x, cls_attn
+
+
+class VisionProjector(nn.Module):
+    def __init__(self, in_dim: int, out_dim: int):
+        super().__init__()
+        hidden = min(out_dim * 4, 8192)
+        self.fc1 = nn.Linear(in_dim, hidden, bias=False)
         self.act = nn.SiLU()
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(out_channels)
-        
-        self.shortcut = nn.Identity()
-        if in_channels != out_channels:
-            self.shortcut = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
-                nn.BatchNorm2d(out_channels)
-            )
+        self.fc2 = nn.Linear(hidden, out_dim, bias=False)
 
-    def forward(self, x):
-        residual = self.shortcut(x)
-        x = self.act(self.bn1(self.conv1(x)))
-        x = self.bn2(self.conv2(x))
-        return self.act(x + residual)
+        nn.init.normal_(self.fc1.weight, std=0.02)
+        nn.init.normal_(self.fc2.weight, std=0.02)
 
-class StaggeredVisionEncoder(nn.Module):
-    def __init__(self, hidden_size: int, base_width: int = 64):
-        super().__init__()
-        # 224x224 -> 112x112
-        self.stage1_down = nn.Conv2d(3, base_width, kernel_size=3, stride=2, padding=1, bias=False)
-        self.stage1_res = ConvResidualBlock(base_width, base_width * 2)
-        
-        # 112x112 -> 56x56
-        self.stage2_down = nn.Conv2d(base_width * 2, base_width * 4, kernel_size=3, stride=2, padding=1, bias=False)
-        self.stage2_res = ConvResidualBlock(base_width * 4, base_width * 4)
-        
-        # 56x56 -> 28x28
-        self.stage3_down = nn.Conv2d(base_width * 4, base_width * 8, kernel_size=3, stride=2, padding=1, bias=False)
-        self.stage3_res = ConvResidualBlock(base_width * 8, base_width * 8)
-        
-        # 28x28 -> 14x14
-        self.stage4_down = nn.Conv2d(base_width * 8, base_width * 16, kernel_size=3, stride=2, padding=1, bias=False)
-        self.stage4_res = ConvResidualBlock(base_width * 16, base_width * 16)
-
-        # 14x14 -> 7x7
-        self.stage5_down = nn.Conv2d(base_width * 16, base_width * 32, kernel_size=3, stride=2, padding=1, bias=False)
-        self.stage5_res = ConvResidualBlock(base_width * 32, base_width * 32)
-        
-        # Final projection: (B, base_width*32, 7, 7) -> (B, 49, hidden_size)
-        self.proj = nn.Linear(base_width * 32, hidden_size, bias=False)
-
-        self._init_weights()
-
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, std=0.02)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-
-    def forward(self, images: torch.Tensor) -> torch.Tensor:
-        # Step-by-step downsampling
-        x = self.stage1_down(images)
-        x = self.stage1_res(x)
-        
-        x = self.stage2_down(x)
-        x = self.stage2_res(x)
-        
-        x = self.stage3_down(x)
-        x = self.stage3_res(x)
-        
-        x = self.stage4_down(x)
-        x = self.stage4_res(x)
-
-        x = self.stage5_down(x)
-        x = self.stage5_res(x)
-        
-        # Flatten and project
-        # (B, C, H, W) -> (B, C, H*W) -> (B, H*W, C)
-        x = x.flatten(2).transpose(1, 2).contiguous()
-        return self.proj(x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.fc2(x)
+        return x
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 1000000.0):
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
@@ -270,7 +233,8 @@ class Qwen3Model(nn.Module):
         self.embed_tokens = nn.Embedding(config['vocab_size'], config['hidden_size'])
         self.layers = nn.ModuleList([Qwen3DecoderLayer(config) for _ in range(config['num_hidden_layers'])])
         self.norm = RMSNorm(config['hidden_size'], eps=config['rms_norm_eps'])
-        self.vision = StaggeredVisionEncoder(config['hidden_size'], base_width=64)
+        self.vision_backbone = FastViTHDVisionEncoder()
+        self.vision_projector = VisionProjector(self.vision_backbone.out_dim, config['hidden_size'])
         
         cos, sin = precompute_freqs_cis(config['head_dim'], config['max_position_embeddings'], config['rope_theta'])
         self.register_buffer("cos", cos, persistent=False)
@@ -324,6 +288,10 @@ class Qwen3Model(nn.Module):
         
         return self.norm(x), new_past_key_values
 
+    def encode_images(self, images: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        tokens, cls_attn = self.vision_backbone(images)
+        return self.vision_projector(tokens), cls_attn
+
 class Qwen3ForCausalLM(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -353,5 +321,5 @@ class Qwen3ForCausalLM(nn.Module):
         logits = self.lm_head(hidden_states)
         return logits, next_past_key_values
 
-    def encode_images(self, images: torch.Tensor) -> torch.Tensor:
-        return self.model.vision(images)
+    def encode_images(self, images: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        return self.model.encode_images(images)
