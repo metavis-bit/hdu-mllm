@@ -10,14 +10,6 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoTokenizer
 
-try:
-    from peft import LoraConfig, get_peft_model, TaskType, PeftModel
-    PEFT_AVAILABLE = True
-except ImportError:
-    PEFT_AVAILABLE = False
-    class PeftModel:
-        pass
-
 from loader import load_qwen3_custom
 from inference import _count_markers, _find_marker_end_token_indices, _last_user_region
 
@@ -94,7 +86,7 @@ def _load_images(image_paths: Sequence[str]) -> torch.Tensor:
 
     images: List[torch.Tensor] = []
     for p in image_paths:
-        img = Image.open(p).convert("RGB").resize((224, 224))
+        img = Image.open(p).convert("RGB").resize((1024, 1024))
         arr = np.asarray(img, dtype=np.float32) / 255.0
         arr = (arr - mean) / std
         t = torch.from_numpy(arr).permute(2, 0, 1).contiguous()
@@ -243,6 +235,8 @@ class MultimodalCollator:
                 device=self.device, dtype=self.model_dtype, non_blocking=True
             )
             image_tokens_all = model.encode_images(flat_images)
+            if isinstance(image_tokens_all, tuple):
+                image_tokens_all, _ = image_tokens_all
             if image_tokens_all.shape[0] != total_images:
                 raise RuntimeError(
                     f"encode_images returned {image_tokens_all.shape[0]} images, expected {total_images}."
@@ -263,10 +257,7 @@ class MultimodalCollator:
             zip(input_ids_list, labels_list, marker_ends_list, image_tokens_per_sample)
         ):
             input_ids = input_ids.to(device=self.device, non_blocking=True)
-            
-            # 兼容 PEFT 包装后的模型结构
-            raw_model = model.get_base_model() if hasattr(model, "get_base_model") else model
-            text_embeds = raw_model.model.embed_tokens(input_ids.unsqueeze(0))
+            text_embeds = model.model.embed_tokens(input_ids.unsqueeze(0))
             
             labels = labels.to(device=self.device, non_blocking=True)
             mask = torch.ones_like(labels, dtype=torch.int8)
@@ -327,47 +318,15 @@ def train(args: argparse.Namespace) -> None:
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir, trust_remote_code=True)
     model = load_qwen3_custom(args.model_dir, device=device, dtype=torch.bfloat16)
 
-    # Apply LoRA if requested
-    if args.use_lora:
-        if not PEFT_AVAILABLE:
-            raise ImportError("PEFT is not installed. Please install it with `pip install peft`.")
-        
-        print("Applying LoRA...")
-        target_modules = args.lora_target_modules
-        if isinstance(target_modules, str):
-            target_modules = [m.strip() for m in target_modules.split(",")]
-            
-        lora_config = LoraConfig(
-            r=args.lora_r,
-            lora_alpha=args.lora_alpha,
-            target_modules=target_modules,
-            lora_dropout=args.lora_dropout,
-            bias="none",
-            task_type=None,  # 自定义模型需设为 None，避免 PEFT 检查 HF 接口
-        )
-        model = get_peft_model(model, lora_config)
-
-    # 冻结与训练逻辑
-    if args.use_lora:
-        # PEFT 自动处理 LoRA 参数梯度，我们需要手动开启视觉部分梯度（如果需要）
-        if args.train_vision:
-            for name, param in model.named_parameters():
-                if "vision" in name:
-                    param.requires_grad = True
-    else:
-        # 非 LoRA 模式：冻结 LLM，只练视觉
-        for name, param in model.named_parameters():
-            if "vision" in name:
-                param.requires_grad = True
-            else:
-                param.requires_grad = False
+    for name, param in model.named_parameters():
+        if ("vision_backbone" in name) or ("vision_projector" in name):
+            param.requires_grad = True
+        else:
+            param.requires_grad = False
 
     # 在所有梯度设置完成后，再统计参数量
-    if args.use_lora:
-        model.print_trainable_parameters()
-    else:
-        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"trainable params: {trainable_params:,}")
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"trainable params: {trainable_params:,}")
 
     # 统一打印所有可训练参数，让你看得清楚
     print("--- Trainable Parameters ---")
@@ -471,30 +430,19 @@ def save_checkpoint(model, optim, step, save_dir, is_final=False):
     
     ckpt_path = os.path.join(save_dir, ckpt_name)
     
-    # Handle PEFT model saving
-    if PEFT_AVAILABLE and isinstance(model, PeftModel):
-        # Only save trainable parameters (LoRA weights + any other trainable params like vision)
-        print(f"Saving PEFT checkpoint to {ckpt_path} (bfloat16)...")
-        trainable_state_dict = {k: v.cpu().to(torch.bfloat16) for k, v in model.named_parameters() if v.requires_grad}
-        torch.save({
-            "step": step,
-            "model": trainable_state_dict,
-            "optim": optim.state_dict(),
-            "is_peft": True
-        }, ckpt_path)
-    else:
-        # Convert state_dict to bfloat16 for space saving
-        model_state = model.state_dict()
-        for k, v in model_state.items():
-            model_state[k] = v.to(torch.bfloat16)
+    model_state = model.state_dict()
+    for k, v in model_state.items():
+        model_state[k] = v.to(torch.bfloat16)
 
-        print(f"Saving checkpoint to {ckpt_path} (bfloat16)...")
-        torch.save({
+    print(f"Saving checkpoint to {ckpt_path} (bfloat16)...")
+    torch.save(
+        {
             "step": step,
             "model": model_state,
             "optim": optim.state_dict(),
-            "is_peft": False
-        }, ckpt_path)
+        },
+        ckpt_path,
+    )
     print("Done.")
 
 
@@ -516,19 +464,6 @@ def main() -> None:
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--log_every", type=int, default=10)
     p.add_argument("--save_every", type=int, default=0)
-
-    # LoRA arguments
-    p.add_argument("--use_lora", action="store_true", help="Whether to use LoRA")
-    p.add_argument("--lora_r", type=int, default=8, help="LoRA rank")
-    p.add_argument("--lora_alpha", type=int, default=16, help="LoRA alpha")
-    p.add_argument("--lora_dropout", type=float, default=0.05, help="LoRA dropout")
-    p.add_argument(
-        "--lora_target_modules",
-        type=str,
-        default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
-        help="Comma-separated list of target modules for LoRA",
-    )
-    p.add_argument("--train_vision", action="store_true", help="Whether to train vision encoder alongside LoRA")
 
     args = p.parse_args()
     train(args)
