@@ -12,6 +12,7 @@ from transformers import AutoTokenizer
 
 from loader import load_qwen3_custom
 from inference import _count_markers, _find_marker_end_token_indices, _last_user_region
+from vision_token_filter import filter_vision_tokens_with_cls_attn
 
 
 def passthrough_collate(samples: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -99,6 +100,8 @@ class Batch:
     inputs_embeds: torch.Tensor
     attention_mask: torch.Tensor
     labels: torch.Tensor
+    vision_tokens: torch.Tensor
+    vision_attention_mask: torch.Tensor
 
 
 class MultimodalCollator:
@@ -108,11 +111,13 @@ class MultimodalCollator:
         device: str,
         model_dtype: torch.dtype,
         eos_token_id: Optional[int],
+        vision_keep_ratio: float = 1.0,
     ):
         self.tokenizer = tokenizer
         self.device = device
         self.model_dtype = model_dtype
         self.eos_token_id = eos_token_id
+        self.vision_keep_ratio = float(vision_keep_ratio)
 
     def __call__(self, samples: List[Dict[str, Any]]) -> Dict[str, Any]:
         return samples
@@ -172,7 +177,7 @@ class MultimodalCollator:
 
         input_ids_list: List[torch.Tensor] = []
         labels_list: List[torch.Tensor] = []
-        marker_ends_list: List[List[int]] = []
+        prefix_token_lens: List[int] = []
         for p, a_region, enc, img_paths in zip(full_prompts, assistant_regions, encodings, per_sample_image_paths):
             ids = enc["input_ids"]
             input_ids = torch.tensor(ids, dtype=torch.long)
@@ -183,6 +188,17 @@ class MultimodalCollator:
                 offset_mapping = list(offset_mapping)
             a_start, a_end = a_region
             a_end_with_tag = a_end + len(a_end_tag)
+            if offset_mapping is not None:
+                prefix_len = 0
+                for ti, (s, e) in enumerate(offset_mapping):
+                    if s == 0 and e == 0:
+                        continue
+                    if e <= a_start:
+                        prefix_len = ti + 1
+            else:
+                prefix_ids = self.tokenizer(p[:a_start], add_special_tokens=False).input_ids
+                prefix_len = len(prefix_ids)
+            prefix_token_lens.append(max(1, prefix_len))
             
             labels = torch.full_like(input_ids, -100)
             if offset_mapping is not None:
@@ -203,20 +219,33 @@ class MultimodalCollator:
                     labels[lo:hi] = input_ids[lo:hi]
             labels_list.append(labels)
 
-            user_region = _last_user_region(p)
-            marker_ends = _find_marker_end_token_indices(
-                p,
-                input_ids.tolist(),
-                self.tokenizer,
-                marker="<|vision_start|>",
-                offset_mapping=offset_mapping,
-                search_region=user_region,
-            )
-            if img_paths and len(marker_ends) != len(img_paths):
-                raise ValueError(f"<|vision_start|> count ({len(marker_ends)}) must match image_paths ({len(img_paths)}).")
-            marker_ends_list.append(marker_ends)
+            if img_paths:
+                user_region = _last_user_region(p)
+                marker_ends = _find_marker_end_token_indices(
+                    p,
+                    input_ids.tolist(),
+                    self.tokenizer,
+                    marker="<|vision_start|>",
+                    offset_mapping=offset_mapping,
+                    search_region=user_region,
+                )
+                if len(marker_ends) != len(img_paths):
+                    raise ValueError(
+                        f"<|vision_start|> count ({len(marker_ends)}) must match image_paths ({len(img_paths)})."
+                    )
+
+        raw_model = model.get_base_model() if hasattr(model, "get_base_model") else model
+        text_embeds_list: List[torch.Tensor] = []
+        text_prefix_embeds_list: List[torch.Tensor] = []
+        for input_ids, prefix_len in zip(input_ids_list, prefix_token_lens):
+            ids = input_ids.to(device=self.device, non_blocking=True)
+            text_embeds = raw_model.model.embed_tokens(ids.unsqueeze(0)).squeeze(0)
+            text_embeds_list.append(text_embeds)
+            safe_prefix_len = max(1, min(int(prefix_len), int(text_embeds.shape[0])))
+            text_prefix_embeds_list.append(text_embeds[:safe_prefix_len])
 
         image_tokens_per_sample: List[List[torch.Tensor]] = [[] for _ in samples]
+        cls_attn_per_sample: List[List[Optional[torch.Tensor]]] = [[] for _ in samples]
         image_counts: List[int] = []
         flat_images_cpu: List[torch.Tensor] = []
         for s in samples:
@@ -234,9 +263,13 @@ class MultimodalCollator:
             flat_images = torch.cat(flat_images_cpu, dim=0).to(
                 device=self.device, dtype=self.model_dtype, non_blocking=True
             )
-            image_tokens_all = model.encode_images(flat_images)
-            if isinstance(image_tokens_all, tuple):
-                image_tokens_all, _ = image_tokens_all
+            enc_out = model.encode_images(flat_images)
+            if isinstance(enc_out, tuple):
+                image_tokens_all, cls_attn_all = enc_out
+            else:
+                image_tokens_all, cls_attn_all = enc_out, None
+            if cls_attn_all is not None and cls_attn_all.shape[0] != total_images:
+                cls_attn_all = None
             if image_tokens_all.shape[0] != total_images:
                 raise RuntimeError(
                     f"encode_images returned {image_tokens_all.shape[0]} images, expected {total_images}."
@@ -245,52 +278,59 @@ class MultimodalCollator:
             for bi, cnt in enumerate(image_counts):
                 if cnt > 0:
                     toks = image_tokens_all[ptr : ptr + cnt]
+                    cls_slice = cls_attn_all[ptr : ptr + cnt] if cls_attn_all is not None else None
                     for i in range(toks.shape[0]):
                         image_tokens_per_sample[bi].append(toks[i])
+                        cls_attn_per_sample[bi].append(cls_slice[i] if cls_slice is not None else None)
                     ptr += cnt
+
+        hidden_size = int(raw_model.model.embed_tokens.embedding_dim)
+        vision_tokens_list: List[torch.Tensor] = []
+        vision_mask_list: List[torch.Tensor] = []
+        for img_tokens_list, cls_list, text_tokens in zip(image_tokens_per_sample, cls_attn_per_sample, text_prefix_embeds_list):
+            if img_tokens_list:
+                vt = torch.cat(img_tokens_list, dim=0).unsqueeze(0)
+                cls_cat = None
+                if cls_list and all(c is not None for c in cls_list):
+                    cls_cat = torch.cat([c for c in cls_list if c is not None], dim=-1).unsqueeze(0)
+                filtered_tokens, filtered_mask = filter_vision_tokens_with_cls_attn(
+                    cls_cat,
+                    text_tokens.unsqueeze(0),
+                    vt,
+                    self.vision_keep_ratio,
+                )
+                vt = filtered_tokens.squeeze(0).to(device=self.device, dtype=self.model_dtype, non_blocking=True)
+                vm = filtered_mask.squeeze(0).to(device=self.device, dtype=torch.int8, non_blocking=True)
+            else:
+                vt = torch.zeros((0, hidden_size), device=self.device, dtype=self.model_dtype)
+                vm = torch.zeros((0,), device=self.device, dtype=torch.int8)
+            vision_tokens_list.append(vt)
+            vision_mask_list.append(vm)
+
+        max_vlen = max((v.shape[0] for v in vision_tokens_list), default=0)
+        if max_vlen > 0:
+            batch_vision_tokens = torch.zeros(
+                (len(samples), max_vlen, hidden_size), device=self.device, dtype=self.model_dtype
+            )
+            batch_vision_mask = torch.zeros((len(samples), max_vlen), device=self.device, dtype=torch.int8)
+            for i, (vt, vm) in enumerate(zip(vision_tokens_list, vision_mask_list)):
+                L = vt.shape[0]
+                if L > 0:
+                    batch_vision_tokens[i, :L] = vt
+                    batch_vision_mask[i, :L] = vm
+        else:
+            batch_vision_tokens = torch.zeros((len(samples), 0, hidden_size), device=self.device, dtype=self.model_dtype)
+            batch_vision_mask = torch.zeros((len(samples), 0), device=self.device, dtype=torch.int8)
 
         seq_embeds: List[torch.Tensor] = []
         seq_labels: List[torch.Tensor] = []
         seq_masks: List[torch.Tensor] = []
 
-        for bi, (input_ids, labels, marker_ends, img_tokens_list) in enumerate(
-            zip(input_ids_list, labels_list, marker_ends_list, image_tokens_per_sample)
-        ):
-            input_ids = input_ids.to(device=self.device, non_blocking=True)
-            text_embeds = model.model.embed_tokens(input_ids.unsqueeze(0))
-            
+        for text_embeds, labels in zip(text_embeds_list, labels_list):
             labels = labels.to(device=self.device, non_blocking=True)
             mask = torch.ones_like(labels, dtype=torch.int8)
 
-            if img_tokens_list:
-                if len(img_tokens_list) != len(marker_ends):
-                    raise RuntimeError("Image/token alignment mismatch within sample.")
-                inserts = []
-                for end_idx, img_tok in zip(marker_ends, img_tokens_list):
-                    inserts.append((end_idx + 1, img_tok))
-                inserts.sort(key=lambda x: x[0], reverse=True)
-
-                inputs_embeds = text_embeds
-                labels_seq = labels
-                mask_seq = mask
-                for pos, tok in inserts:
-                    tok = tok.to(device=self.device, dtype=self.model_dtype, non_blocking=True)
-                    tok_len = tok.shape[0]
-                    inputs_embeds = torch.cat(
-                        [inputs_embeds[:, :pos, :], tok.unsqueeze(0), inputs_embeds[:, pos:, :]],
-                        dim=1,
-                    )
-                    img_labels = torch.full((tok_len,), -100, device=labels_seq.device, dtype=labels_seq.dtype)
-                    img_mask = torch.ones((tok_len,), device=mask_seq.device, dtype=mask_seq.dtype)
-                    labels_seq = torch.cat([labels_seq[:pos], img_labels, labels_seq[pos:]], dim=0)
-                    mask_seq = torch.cat([mask_seq[:pos], img_mask, mask_seq[pos:]], dim=0)
-                    if not torch.equal(inputs_embeds[:, pos : pos + tok_len, :], tok.unsqueeze(0)):
-                        raise RuntimeError("Image token insertion check failed.")
-                text_embeds = inputs_embeds
-                labels = labels_seq
-                mask = mask_seq
-
-            seq_embeds.append(text_embeds.squeeze(0))
+            seq_embeds.append(text_embeds)
             seq_labels.append(labels)
             seq_masks.append(mask)
 
@@ -307,7 +347,13 @@ class MultimodalCollator:
             batch_labels[i, :L] = lab.to(device=self.device, dtype=torch.long, non_blocking=True)
             batch_mask[i, :L] = msk.to(device=self.device, dtype=torch.int8, non_blocking=True)
 
-        return Batch(inputs_embeds=batch_embeds, attention_mask=batch_mask, labels=batch_labels)
+        return Batch(
+            inputs_embeds=batch_embeds,
+            attention_mask=batch_mask,
+            labels=batch_labels,
+            vision_tokens=batch_vision_tokens,
+            vision_attention_mask=batch_vision_mask,
+        )
 
 
 def train(args: argparse.Namespace) -> None:
@@ -319,7 +365,7 @@ def train(args: argparse.Namespace) -> None:
     model = load_qwen3_custom(args.model_dir, device=device, dtype=torch.bfloat16)
 
     for name, param in model.named_parameters():
-        if ("vision_backbone" in name) or ("vision_projector" in name):
+        if any(k in name for k in ("vision_backbone", "vision_projector", "mhc", "mhc_gate", "mhc_norm")):
             param.requires_grad = True
         else:
             param.requires_grad = False
@@ -338,7 +384,13 @@ def train(args: argparse.Namespace) -> None:
     eos_token_id = tokenizer.eos_token_id
     dtype = next(model.parameters()).dtype
     dataset = JsonMultimodalDataset(args.data)
-    collator = MultimodalCollator(tokenizer, device=device, model_dtype=dtype, eos_token_id=eos_token_id)
+    collator = MultimodalCollator(
+        tokenizer,
+        device=device,
+        model_dtype=dtype,
+        eos_token_id=eos_token_id,
+        vision_keep_ratio=args.vision_keep_ratio,
+    )
 
     loader = DataLoader(
         dataset,
@@ -373,7 +425,12 @@ def train(args: argparse.Namespace) -> None:
             batch = collator.build_batch(model, samples)
             
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=(device == "cuda")):
-                logits = model(inputs_embeds=batch.inputs_embeds, attention_mask=batch.attention_mask)
+                logits = model(
+                    inputs_embeds=batch.inputs_embeds,
+                    attention_mask=batch.attention_mask,
+                    vision_tokens=batch.vision_tokens,
+                    vision_attention_mask=batch.vision_attention_mask,
+                )
                 shift_logits = logits[:, :-1, :].contiguous()
                 shift_labels = batch.labels[:, 1:].contiguous()
                 loss = F.cross_entropy(
@@ -464,6 +521,7 @@ def main() -> None:
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--log_every", type=int, default=10)
     p.add_argument("--save_every", type=int, default=0)
+    p.add_argument("--vision_keep_ratio", type=float, default=1.0, help="Ratio of vision tokens to keep after filtering.")
 
     args = p.parse_args()
     train(args)

@@ -1,3 +1,4 @@
+import argparse
 import torch
 import torch.nn.functional as F
 from loader import load_qwen3_custom
@@ -6,6 +7,7 @@ import os
 import sys
 import io
 from typing import Optional, Sequence, List, Tuple
+from vision_token_filter import filter_vision_tokens_with_cls_attn
 
 def sample(logits, temperature=1.0, top_k=0, top_p=0.0, repetition_penalty=1.0, input_ids=None):
     """
@@ -161,6 +163,7 @@ def inference(
     enable_thinking=False,
     stream=False,
     image_paths: Optional[Sequence[str]] = None,
+    vision_keep_ratio: float = 1.0,
 ):
     # Limit to last 20 rounds (1 round = user + assistant, so 40 messages)
     # Keep the system message if it exists
@@ -228,6 +231,10 @@ def inference(
             stop_token_ids.append(im_end_id)
 
         with torch.no_grad():
+            vision_tokens = None
+            vision_attention_mask = None
+            raw_model = model.get_base_model() if hasattr(model, "get_base_model") else model
+            text_tokens = raw_model.model.embed_tokens(input_ids)
             if image_paths:
                 region = _last_user_region(full_prompt)
                 marker_ends = _find_marker_end_token_indices(
@@ -245,35 +252,46 @@ def inference(
 
                 param = next(model.parameters(), None)
                 model_dtype = param.dtype if param is not None else torch.float32
+                hidden_size = int(raw_model.model.embed_tokens.embedding_dim)
                 images = _load_images_from_paths(image_paths, device=device, dtype=model_dtype)
                 if images is not None:
-                    image_tokens = model.encode_images(images)
-                    if isinstance(image_tokens, tuple):
-                        image_tokens, _ = image_tokens
-                else:
-                    image_tokens = torch.zeros((0, 0, 0), device=device, dtype=model_dtype)
-                text_embeds = model.model.embed_tokens(input_ids)
-
-                inserts = []
-                for img_i, end_idx in enumerate(marker_ends):
-                    inserts.append((end_idx + 1, image_tokens[img_i : img_i + 1]))
-                inserts.sort(key=lambda x: x[0], reverse=True)
-
-                inputs_embeds = text_embeds
-                for pos, tok in inserts:
-                    inputs_embeds = torch.cat(
-                        [inputs_embeds[:, :pos, :], tok, inputs_embeds[:, pos:, :]],
-                        dim=1,
+                    enc_out = model.encode_images(images)
+                    if isinstance(enc_out, tuple):
+                        image_tokens, cls_attn = enc_out
+                    else:
+                        image_tokens, cls_attn = enc_out, None
+                    flat_tokens = image_tokens.flatten(0, 1).unsqueeze(0)
+                    cls_cat = None
+                    if cls_attn is not None and cls_attn.numel() != 0 and cls_attn.shape[0] == image_tokens.shape[0]:
+                        cls_cat = torch.cat([cls_attn[i] for i in range(cls_attn.shape[0])], dim=-1).unsqueeze(0)
+                    vision_tokens, vision_attention_mask = filter_vision_tokens_with_cls_attn(
+                        cls_cat,
+                        text_tokens,
+                        flat_tokens,
+                        vision_keep_ratio,
                     )
-                    if not torch.equal(inputs_embeds[:, pos : pos + tok.shape[1], :], tok):
-                        raise RuntimeError("Image token insertion check failed.")
+                    vision_tokens = vision_tokens.to(device=device, dtype=model_dtype, non_blocking=True)
+                    vision_attention_mask = vision_attention_mask.to(device=device, dtype=torch.int8, non_blocking=True)
+                else:
+                    vision_tokens = torch.zeros((1, 0, hidden_size), device=device, dtype=model_dtype)
+                    vision_attention_mask = torch.zeros((1, 0), device=device, dtype=torch.int8)
 
                 logits, past_key_values = model.generate_step(
-                    inputs_embeds=inputs_embeds, past_key_values=None, use_cache=True
+                    input_ids,
+                    past_key_values=None,
+                    use_cache=True,
+                    vision_tokens=vision_tokens,
+                    vision_attention_mask=vision_attention_mask,
                 )
                 curr_input_ids_all = input_ids # Start tracking all tokens for penalty
             else:
-                logits, past_key_values = model.generate_step(input_ids, past_key_values=None, use_cache=True)
+                logits, past_key_values = model.generate_step(
+                    input_ids,
+                    past_key_values=None,
+                    use_cache=True,
+                    vision_tokens=vision_tokens,
+                    vision_attention_mask=vision_attention_mask,
+                )
                 curr_input_ids_all = input_ids
 
             curr_input_ids = sample(
@@ -310,7 +328,11 @@ def inference(
                 curr_input_ids_all = torch.cat([curr_input_ids_all, curr_input_ids], dim=1)
                 
                 logits, past_key_values = model.generate_step(
-                    curr_input_ids, past_key_values=past_key_values, use_cache=True
+                    curr_input_ids,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    vision_tokens=vision_tokens,
+                    vision_attention_mask=vision_attention_mask,
                 )
                 curr_input_ids = sample(
                     logits[:, -1, :], 
@@ -342,6 +364,7 @@ def realtime_chat(
     top_p=0.3,
     repetition_penalty=1.1,
     enable_thinking=True,
+    vision_keep_ratio: float = 1.0,
 ):
     print("\n" + "=" * 50)
     print("Qwen3 Custom Chat Mode (Stateless Across Turns)")
@@ -373,6 +396,7 @@ def realtime_chat(
                 repetition_penalty=repetition_penalty,
                 enable_thinking=enable_thinking,
                 stream=True,
+                vision_keep_ratio=vision_keep_ratio,
             ):
                 chunks.append(chunk)
                 print(chunk, end="", flush=True)
@@ -391,17 +415,24 @@ def realtime_chat(
             break
 
 if __name__ == "__main__":
-    model_dir = r"D:\d2l-zh\Mamba\Qwen"
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_dir", type=str, required=True, help="Path to model directory.")
+    parser.add_argument("--device", type=str, default="auto", help="cuda, cpu, or auto.")
+    parser.add_argument("--vision_keep_ratio", type=float, default=1.0, help="Ratio of vision tokens to keep after filtering.")
+    args = parser.parse_args()
+
+    device = args.device
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
     # 1. Load Tokenizer
     print("Loading tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
-    
+    tokenizer = AutoTokenizer.from_pretrained(args.model_dir, trust_remote_code=True)
+
     # 2. Load Custom Model
     print("Loading custom model...")
     # Using bfloat16 for better performance/accuracy on modern GPUs
-    model = load_qwen3_custom(model_dir, device=device, dtype=torch.bfloat16)
-    
+    model = load_qwen3_custom(args.model_dir, device=device, dtype=torch.bfloat16)
+
     # 3. Start Chat
-    realtime_chat(model, tokenizer, device=device)
+    realtime_chat(model, tokenizer, device=device, vision_keep_ratio=args.vision_keep_ratio)
