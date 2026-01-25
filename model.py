@@ -202,20 +202,99 @@ class Qwen3Attention(nn.Module):
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         return self.o_proj(output), present_key_value
 
+
+class MultiHeadCrossAttention(nn.Module):
+    """
+    DeepSeek-style MHC connector: language tokens attend to visual tokens.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.hidden_size = config["hidden_size"]
+        self.num_heads = config["num_attention_heads"]
+        self.head_dim = config["head_dim"]
+
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+
+        # Match the self-attention's per-head normalization.
+        self.q_norm = RMSNorm(self.head_dim, eps=config["rms_norm_eps"])
+        self.k_norm = RMSNorm(self.head_dim, eps=config["rms_norm_eps"])
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        vision_tokens: torch.Tensor,
+        vision_attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        bsz, seqlen, _ = x.shape
+        vlen = vision_tokens.shape[1]
+
+        q = self.q_proj(x).view(bsz, seqlen, self.num_heads, self.head_dim)
+        k = self.k_proj(vision_tokens).view(bsz, vlen, self.num_heads, self.head_dim)
+        v = self.v_proj(vision_tokens).view(bsz, vlen, self.num_heads, self.head_dim)
+
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        q = q.transpose(1, 2)  # (B, H, T, D)
+        k = k.transpose(1, 2)  # (B, H, V, D)
+        v = v.transpose(1, 2)  # (B, H, V, D)
+
+        scores = torch.matmul(q, k.transpose(2, 3)) / math.sqrt(self.head_dim)
+        has_vision = None
+        if vision_attention_mask is not None and vision_attention_mask.numel() != 0:
+            # vision_attention_mask: (B, V), 1=valid, 0=pad
+            valid_counts = vision_attention_mask.sum(dim=-1)
+            has_vision = valid_counts > 0
+            safe_mask = vision_attention_mask.to(dtype=torch.bool)
+            if (~has_vision).any() and safe_mask.shape[1] > 0:
+                # Prevent all -inf rows, then zero them out after attention.
+                safe_mask = safe_mask.clone()
+                safe_mask[~has_vision, 0] = True
+            mask = (~safe_mask)[:, None, None, :]
+            scores = scores.masked_fill(mask, float("-inf"))
+
+        attn = F.softmax(scores.float(), dim=-1).type_as(q)
+        output = torch.matmul(attn, v)
+        if has_vision is not None:
+            output = output * has_vision[:, None, None].to(output.dtype)
+        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+        return self.o_proj(output)
+
 class Qwen3DecoderLayer(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.self_attn = Qwen3Attention(config)
+        self.use_mhc = bool(config.get("use_mhc", True))
+        self.mhc = MultiHeadCrossAttention(config) if self.use_mhc else None
+        gate_init = float(config.get("mhc_gate_init", 0.0))
+        self.mhc_gate = nn.Parameter(torch.tensor(gate_init)) if self.use_mhc else None
+        self.mhc_norm = RMSNorm(config["hidden_size"], eps=config["rms_norm_eps"]) if self.use_mhc else None
         self.mlp = Qwen3MLP(config['hidden_size'], config['intermediate_size'])
         self.input_layernorm = RMSNorm(config['hidden_size'], eps=config['rms_norm_eps'])
         self.post_attention_layernorm = RMSNorm(config['hidden_size'], eps=config['rms_norm_eps'])
 
-    def forward(self, x, cos, sin, attention_mask=None):
+    def forward(self, x, cos, sin, attention_mask=None, vision_tokens=None, vision_attention_mask=None):
         h = x + self.self_attn(self.input_layernorm(x), cos, sin, attention_mask=attention_mask)
+        if self.use_mhc and vision_tokens is not None and vision_tokens.numel() != 0:
+            mhc_out = self.mhc(self.mhc_norm(h), vision_tokens, vision_attention_mask=vision_attention_mask)
+            h = h + self.mhc_gate * mhc_out
         out = h + self.mlp(self.post_attention_layernorm(h))
         return out
 
-    def generate_step(self, x, cos, sin, past_key_value=None, use_cache=False):
+    def generate_step(
+        self,
+        x,
+        cos,
+        sin,
+        past_key_value=None,
+        use_cache=False,
+        vision_tokens=None,
+        vision_attention_mask=None,
+    ):
         attn_out, present_key_value = self.self_attn.generate_step(
             self.input_layernorm(x), 
             cos, 
@@ -224,6 +303,9 @@ class Qwen3DecoderLayer(nn.Module):
             use_cache=use_cache
         )
         h = x + attn_out
+        if self.use_mhc and vision_tokens is not None and vision_tokens.numel() != 0:
+            mhc_out = self.mhc(self.mhc_norm(h), vision_tokens, vision_attention_mask=vision_attention_mask)
+            h = h + self.mhc_gate * mhc_out
         out = h + self.mlp(self.post_attention_layernorm(h))
         return out, present_key_value
 
@@ -240,7 +322,14 @@ class Qwen3Model(nn.Module):
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
 
-    def forward(self, input_ids=None, attention_mask=None, inputs_embeds=None):
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        inputs_embeds=None,
+        vision_tokens: Optional[torch.Tensor] = None,
+        vision_attention_mask: Optional[torch.Tensor] = None,
+    ):
         """
         Standard training forward pass.
         """
@@ -255,11 +344,26 @@ class Qwen3Model(nn.Module):
         sin = self.sin[0:seqlen].to(x.device)
         
         for layer in self.layers:
-            x = layer(x, cos, sin, attention_mask=attention_mask)
+            x = layer(
+                x,
+                cos,
+                sin,
+                attention_mask=attention_mask,
+                vision_tokens=vision_tokens,
+                vision_attention_mask=vision_attention_mask,
+            )
         
         return self.norm(x)
 
-    def generate_step(self, input_ids=None, inputs_embeds=None, past_key_values=None, use_cache=False):
+    def generate_step(
+        self,
+        input_ids=None,
+        inputs_embeds=None,
+        past_key_values=None,
+        use_cache=False,
+        vision_tokens: Optional[torch.Tensor] = None,
+        vision_attention_mask: Optional[torch.Tensor] = None,
+    ):
         """
         Inference step with KV Cache support.
         """
@@ -282,7 +386,15 @@ class Qwen3Model(nn.Module):
         new_past_key_values = [] if use_cache else None
         for i, layer in enumerate(self.layers):
             past_kv = past_key_values[i] if past_key_values is not None else None
-            x, present_kv = layer.generate_step(x, cos, sin, past_key_value=past_kv, use_cache=use_cache)
+            x, present_kv = layer.generate_step(
+                x,
+                cos,
+                sin,
+                past_key_value=past_kv,
+                use_cache=use_cache,
+                vision_tokens=vision_tokens,
+                vision_attention_mask=vision_attention_mask,
+            )
             if use_cache:
                 new_past_key_values.append(present_kv)
         
@@ -300,15 +412,36 @@ class Qwen3ForCausalLM(nn.Module):
         if config.get('tie_word_embeddings', False):
             self.lm_head.weight = self.model.embed_tokens.weight
 
-    def forward(self, input_ids=None, attention_mask=None, inputs_embeds=None):
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        inputs_embeds=None,
+        vision_tokens: Optional[torch.Tensor] = None,
+        vision_attention_mask: Optional[torch.Tensor] = None,
+    ):
         """
         Standard training forward pass.
         """
-        hidden_states = self.model(input_ids, attention_mask=attention_mask, inputs_embeds=inputs_embeds)
+        hidden_states = self.model(
+            input_ids,
+            attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+            vision_tokens=vision_tokens,
+            vision_attention_mask=vision_attention_mask,
+        )
         logits = self.lm_head(hidden_states)
         return logits
 
-    def generate_step(self, input_ids=None, inputs_embeds=None, past_key_values=None, use_cache=False):
+    def generate_step(
+        self,
+        input_ids=None,
+        inputs_embeds=None,
+        past_key_values=None,
+        use_cache=False,
+        vision_tokens: Optional[torch.Tensor] = None,
+        vision_attention_mask: Optional[torch.Tensor] = None,
+    ):
         """
         Inference step with KV Cache support.
         """
@@ -316,7 +449,9 @@ class Qwen3ForCausalLM(nn.Module):
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
             past_key_values=past_key_values, 
-            use_cache=use_cache
+            use_cache=use_cache,
+            vision_tokens=vision_tokens,
+            vision_attention_mask=vision_attention_mask,
         )
         logits = self.lm_head(hidden_states)
         return logits, next_past_key_values
